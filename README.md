@@ -22,6 +22,33 @@ reasoning, per-prior results against baseline/controls/permutation null,
 comparison to TRACE's original TF-target finding, limitations, and what a
 future ligand-receptor phase would need.
 
+## Results
+
+Donor-level AUROC (SLE vs. normal), 30 seed x fold CV splits, paired
+Wilcoxon signed-rank test, Bonferroni-corrected within each prior's
+comparison family (4 comparisons for TF-target including its sign-flip
+control, 3 for epigenomic). Full numbers: `results/tables/scorecard.csv`
+and `results/tables/significance_tests.md`.
+
+| prior | comparison | real | other | p (Wilcoxon) | significant | verdict |
+|---|---|---|---|---|---|---|
+| tf_target | real vs. baseline_pca | 0.959 | 0.984 | 3.2e-6 | yes | real loses |
+| tf_target | real vs. C1 degree-preserving | 0.959 | 0.963 | 0.428 | no | no difference |
+| tf_target | real vs. C2 fully random | 0.959 | 0.929 | 1.3e-7 | yes | real wins |
+| tf_target | real vs. C3 sign-flipped | 0.959 | 0.959 | 0.777 | no | no difference |
+| epigenomic | real vs. baseline_pca | 0.927 | 0.984 | 2.0e-6 | yes | real loses |
+| epigenomic | real vs. C1 degree-preserving | 0.927 | 0.937 | 0.013 | yes | **real loses** |
+| epigenomic | real vs. C2 fully random | 0.927 | 0.933 | 0.280 | no | no difference |
+
+**TF-target** reproduces TRACE's original finding shape exactly: the real
+graph ties its degree-preserving control and loses to an unconstrained
+PCA baseline -- the harness's correctness check passes. **Epigenomic**
+does not even manage that: it loses to its own degree-preserving rewiring
+and is statistically indistinguishable from a fully-random graph of the
+same size. Neither prior beats plain PCA on this target; see `MEMO.md`
+for the sanity-probe finding (a much weaker cell-type-identity signal in
+epigenomic's embedding) that's the most concrete lead for why.
+
 ## The harness
 
 Prior-specific code is limited to exactly two things, per prior:
