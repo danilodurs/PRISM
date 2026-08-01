@@ -19,6 +19,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from scipy import stats
+from threadpoolctl import threadpool_limits
 
 from src.evaluate import FoldEmbeddings, score_classification_probe
 
@@ -98,23 +99,29 @@ def label_permutation_null(
 
     auroc_metric = "auroc" if positive_label is not None else "auroc_macro_ovr"
     rows = []
-    for perm in range(n_permutations):
-        permuted = rng.permutation(donor_labels.to_numpy())
-        donor_map = dict(zip(donor_labels.index, permuted))
-        perm_meta = meta.copy()
-        perm_meta[label_col] = perm_meta["donor_id"].map(donor_map)
+    # this loop refits a small LogisticRegression per (permutation, fold) --
+    # thousands of tiny fits. Left to its default, BLAS spins up a full
+    # thread pool per fit, which oversubscribes the machine (more runnable
+    # threads than cores) for no throughput benefit on matrices this small.
+    # One thread per fit is faster in aggregate here.
+    with threadpool_limits(limits=1):
+        for perm in range(n_permutations):
+            permuted = rng.permutation(donor_labels.to_numpy())
+            donor_map = dict(zip(donor_labels.index, permuted))
+            perm_meta = meta.copy()
+            perm_meta[label_col] = perm_meta["donor_id"].map(donor_map)
 
-        scored = score_classification_probe(fold_embeddings, perm_meta, label_col, positive_label=positive_label)
-        auroc_rows = scored[scored["metric"] == auroc_metric]
-        acc_rows = scored[scored["metric"] == "accuracy"]
-        rows.append(
-            {
-                "permutation": perm,
-                "mean_auroc": auroc_rows["score"].mean(),
-                "mean_accuracy": acc_rows["score"].mean(),
-                "n_folds_scored": len(auroc_rows),
-            }
-        )
+            scored = score_classification_probe(fold_embeddings, perm_meta, label_col, positive_label=positive_label)
+            auroc_rows = scored[scored["metric"] == auroc_metric]
+            acc_rows = scored[scored["metric"] == "accuracy"]
+            rows.append(
+                {
+                    "permutation": perm,
+                    "mean_auroc": auroc_rows["score"].mean(),
+                    "mean_accuracy": acc_rows["score"].mean(),
+                    "n_folds_scored": len(auroc_rows),
+                }
+            )
     return pd.DataFrame(rows)
 
 
