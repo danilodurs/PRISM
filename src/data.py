@@ -1,13 +1,19 @@
-"""Census access and donor x cell_type pseudobulk construction for the SLE
-PBMC dataset (Perez et al. 2022, CELLxGENE Census dataset
-`218acb0f-9f2f-4f76-b90b-15a4b7c7f629`) -- the only SLE cohort in Census
-(confirmed at validation time: every SLE-labeled cell in Census belongs to
-this one dataset). See `results/tables/step0_validation.md` for why this
-dataset's target is SLE-vs-normal disease status rather than a 3-tier
-activity score: the dataset carries no SLEDAI or other composite activity
-score, and its coarse `disease_state` field (flare/managed/treated) is both
-severely imbalanced and, for some donors, inconsistent across cells from the
-same donor_id (a per-visit label, not a stable per-donor one).
+"""Census access and donor x cell_type pseudobulk construction, parameterized
+by `src.datasets.DatasetConfig` (default `RA`, this repo's primary target:
+Binvignat et al. 2024, CELLxGENE Census dataset
+`d18736c3-6292-4379-919a-d6d973204c87` -- the only RA cohort in Census,
+confirmed at validation time). An SLE cohort (Perez et al. 2022, dataset
+`218acb0f-9f2f-4f76-b90b-15a4b7c7f629`) is also supported via
+`--dataset sle` for anyone who wants it. See
+`results/tables/step0_validation.md` for why RA's DAS28 activity score,
+though present and per-donor stable, is used only as a descriptive probe
+rather than a primary/secondary CV target (too few non-missing donors for
+the existing 6-fold donor-level CV protocol) -- and why SLE's target, if
+you run that path, is SLE-vs-normal disease status rather than a 3-tier
+activity score (that dataset carries no SLEDAI or other composite activity
+score, and its coarse `disease_state` field is both severely imbalanced and,
+for some donors, inconsistent across cells from the same donor_id -- a
+per-visit label, not a stable per-donor one).
 """
 
 from __future__ import annotations
@@ -18,11 +24,17 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-DATASET_ID = "218acb0f-9f2f-4f76-b90b-15a4b7c7f629"
-CENSUS_VERSION = "2025-11-08"
+from src.datasets import RA, DatasetConfig
+
 MIN_CELLS_PER_PROFILE = 10
 MIN_DONOR_COVERAGE = 0.8  # keep a cell type only if present at threshold in >= this fraction of donors
-RAW_H5AD_PATH = Path(__file__).resolve().parents[1] / "data" / "raw_dataset.h5ad"
+
+# Default fallbacks for direct/interactive use (single source of truth is
+# src/datasets.py::RA) -- every pipeline script passes an explicit `config`
+# instead of relying on these.
+DATASET_ID = RA.dataset_id
+CENSUS_VERSION = RA.census_version
+RAW_H5AD_PATH = RA.raw_h5ad_path
 
 
 def load_obs(census_version: str = CENSUS_VERSION, dataset_id: str = DATASET_ID) -> pd.DataFrame:
@@ -46,33 +58,29 @@ def load_obs(census_version: str = CENSUS_VERSION, dataset_id: str = DATASET_ID)
     return obs
 
 
-def load_extra_obs_fields(h5ad_path: Path = RAW_H5AD_PATH) -> pd.DataFrame:
+def load_extra_obs_fields(h5ad_path: Path = RAW_H5AD_PATH, config: DatasetConfig = RA) -> pd.DataFrame:
     """Submission-specific obs columns not preserved in Census's standardized
-    schema: disease_state (flare/managed/treated/na -- the closest thing to
-    an activity label this dataset has), Processing_Cohort (technical batch),
-    author_cell_type and cell_state (finer-grained annotations than Census's
-    own cell_type, relevant for a future ligand-receptor phase). Read
-    directly from the local h5ad's obs group so row order is self-consistent
-    (no join against a separately-fetched Census obs call).
+    schema (per-dataset mapping in `config.extra_obs_columns`, local name ->
+    h5ad obs column -- e.g. for SLE: disease_state, Processing_Cohort,
+    author_cell_type, cell_state; for RA: DAS28 activity scores, treatment
+    flags, processing batch). Read directly from the local h5ad's obs group
+    so row order is self-consistent (no join against a separately-fetched
+    Census obs call). Columns may be plain numeric datasets (e.g. RA's
+    continuous DAS28 fields) or categorical groups; both are handled.
     """
     import h5py
 
-    def read_cat(obs_group, col):
-        g = obs_group[col]
-        cats = np.array([c.decode() for c in g["categories"][:]])
-        codes = g["codes"][:]
-        return pd.Categorical.from_codes(codes, categories=cats)
+    def read_col(obs_group, col):
+        item = obs_group[col]
+        if isinstance(item, h5py.Group):
+            cats = np.array([c.decode() if isinstance(c, bytes) else c for c in item["categories"][:]])
+            codes = item["codes"][:]
+            return pd.Categorical.from_codes(codes, categories=cats)
+        return item[:]
 
     with h5py.File(h5ad_path, "r") as h5:
         obs = h5["obs"]
-        return pd.DataFrame(
-            {
-                "disease_state": read_cat(obs, "disease_state"),
-                "processing_cohort": read_cat(obs, "Processing_Cohort"),
-                "author_cell_type": read_cat(obs, "author_cell_type"),
-                "cell_state": read_cat(obs, "cell_state"),
-            }
-        )
+        return pd.DataFrame({local: read_col(obs, col) for local, col in config.extra_obs_columns.items()})
 
 
 def eligible_cell_types(
@@ -111,10 +119,20 @@ def _read_categorical_or_plain(group, col: str):
     return item[:]
 
 
-def _read_h5ad_obs(h5: "h5py.File") -> pd.DataFrame:
+def _read_h5ad_obs(h5: "h5py.File", extra_obs_columns: dict[str, str] | None = None) -> pd.DataFrame:
+    """Standard per-cell fields every dataset needs (donor_id, cell_type,
+    disease, sex, self_reported_ethnicity) plus any dataset-specific extras
+    (`config.extra_obs_columns`, e.g. RA's DAS28/treatment/batch fields),
+    read from the same obs group so row order stays aligned with the raw X
+    matrix reads in `build_pseudobulk_streaming`.
+    """
     obs = h5["obs"]
     cols = ["donor_id", "cell_type", "disease", "sex", "self_reported_ethnicity"]
-    return pd.DataFrame({c: _read_categorical_or_plain(obs, c) for c in cols})
+    data = {c: _read_categorical_or_plain(obs, c) for c in cols}
+    for local, col in (extra_obs_columns or {}).items():
+        if local not in data:
+            data[local] = _read_categorical_or_plain(obs, col)
+    return pd.DataFrame(data)
 
 
 def load_dataset_gene_panel(h5ad_path: Path = RAW_H5AD_PATH) -> set[str]:
@@ -135,9 +153,10 @@ def load_dataset_gene_panel(h5ad_path: Path = RAW_H5AD_PATH) -> set[str]:
 def build_pseudobulk_streaming(
     genes: list[str],
     cell_types: list[str],
-    h5ad_path: Path = RAW_H5AD_PATH,
+    h5ad_path: Path | None = None,
     min_cells: int = MIN_CELLS_PER_PROFILE,
     chunk_size: int = 100_000,
+    config: DatasetConfig = RA,
 ) -> tuple[pd.DataFrame, np.ndarray, list[str]]:
     """Sum raw counts per (donor, cell_type) group meeting the min-cell
     threshold, streaming the source h5ad's raw counts in row-chunks rather
@@ -160,12 +179,17 @@ def build_pseudobulk_streaming(
     dataset's `total_counts`) -- computed directly from raw counts instead.
 
     Returns (metadata, log1p-CPM matrix [profiles x genes], gene_symbols) with
-    genes ordered as the input `genes` list.
+    genes ordered as the input `genes` list. `config` supplies the dataset-
+    specific extra obs fields (RA's DAS28/treatment/batch, SLE's
+    disease_state/Processing_Cohort/...) that get carried into the returned
+    metadata per `config.donor_meta_columns`.
     """
     import h5py
 
+    h5ad_path = h5ad_path if h5ad_path is not None else config.raw_h5ad_path
+
     with h5py.File(h5ad_path, "r") as h5:
-        obs = _read_h5ad_obs(h5)
+        obs = _read_h5ad_obs(h5, config.extra_obs_columns)
         feature_names = _read_categorical_or_plain(h5["raw"]["var"], "feature_name")
         feature_names = [v.decode() if isinstance(v, bytes) else str(v) for v in feature_names]
         var = pd.DataFrame({"feature_name": feature_names})
@@ -240,7 +264,7 @@ def build_pseudobulk_streaming(
     log_expr = np.log1p(cpm)
 
     meta_rows = []
-    donor_meta = obs.drop_duplicates("donor_id").set_index("donor_id")[["disease", "sex", "self_reported_ethnicity"]]
+    donor_meta = obs.drop_duplicates("donor_id").set_index("donor_id")[config.donor_meta_columns]
     donor_meta.index = donor_meta.index.astype(str)
     for (donor_id, cell_type), n_cells in zip(kept_group_keys, n_cells_accum[keep_groups]):
         row = donor_meta.loc[donor_id].to_dict()
